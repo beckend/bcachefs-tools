@@ -2012,7 +2012,6 @@ batch_done:
 	}
 
 	unsigned worker_ids[32];
-	void *src_ptrs[32];
 	size_t src_lens[32];
 	struct bpos positions[32];
 
@@ -2021,21 +2020,15 @@ batch_done:
 	for (unsigned i = 0; i < batch; i++) {
 		unsigned wid = i % nr_workers;
 		worker_ids[i] = wid;
-		src_ptrs[i] = kmalloc(ctx->chunk_src_len[i], GFP_NOFS);
-		if (!src_ptrs[i])
-			goto err_src_ptrs;
-		memcpy_from_bio(src_ptrs[i], src, ctx->chunk_iter[i]);
+		memcpy_from_bio(pool->slots[wid].src_buf, src, ctx->chunk_iter[i]);
 		src_lens[i] = ctx->chunk_src_len[i];
 		positions[i] = ctx->chunk_pos[i];
 	}
 
 	struct mt_completion completion;
-	mt_pool_submit(pool, worker_ids, src_ptrs, src_lens, positions,
+	mt_pool_submit(pool, worker_ids, src_lens, positions,
 		       op->compression_opt, extent_max, &completion, batch);
 	mt_pool_wait(&completion);
-
-	for (unsigned i = 0; i < batch; i++)
-		kfree(src_ptrs[i]);
 
 	op->pos.offset = orig_pos_offset;
 
@@ -2176,16 +2169,8 @@ err_encrypt:
 	op->insert_keys.top_p = saved_keys_top;
 	op->nonce = orig_nonce;
 	op->pos.offset = orig_pos_offset;
-	for (unsigned i = 0; i < batch; i++)
-		kfree(src_ptrs[i]);
 	bch_write_mt_ctx_free(ctx);
 	return ret;
-
-err_src_ptrs:
-	for (unsigned j = 0; j < batch; j++)
-		kfree(src_ptrs[j]);
-	bch_write_mt_ctx_free(ctx);
-	return -ENOMEM;
 }
 
 static int bch2_write_extent(struct bch_write_op *op, struct write_point *wp,

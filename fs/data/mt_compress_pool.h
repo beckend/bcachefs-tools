@@ -73,7 +73,6 @@ void mt_compress_pool_destroy(struct bch_fs *c);
 
 void mt_pool_submit(struct mt_compress_pool *pool,
 		    unsigned *worker_ids,
-		    void **src_ptrs,
 		    size_t *src_lens,
 		    struct bpos *positions,
 		    unsigned compression_opt,

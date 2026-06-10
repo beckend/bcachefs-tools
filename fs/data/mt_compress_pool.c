@@ -19,6 +19,10 @@
 #include <sys/syscall.h>
 #include <stdlib.h>
 #include <string.h>
+#define kvmalloc(size, flags) malloc(size)
+#define kvfree(ptr) free(ptr)
+#define cpu_to_node(cpu) 0
+#define kmalloc_node(size, flags, node) ((void)(node), kmalloc(size, flags))
 #else
 #include <linux/kthread.h>
 #include <linux/wait.h>
@@ -206,13 +210,19 @@ static int mt_start_workers(struct mt_compress_pool *pool)
 
 int mt_compress_pool_init(struct bch_fs *c)
 {
-	unsigned nr = bch2_compress_nr_workers();
+	unsigned nr = min_t(unsigned, bch2_compress_nr_workers(), 4);
 	size_t ws_size = mt_workspace_size(c);
 	unsigned extent_max = c->opts.encoded_extent_max;
 	int ret = 0;
 
 	if (nr > MT_MAX_WORKERS)
 		nr = MT_MAX_WORKERS;
+
+	size_t per_worker = ws_size + extent_max * 3;
+	size_t max_pool_mem = 256 * 1024 * 1024;
+	unsigned mem_cap = max_pool_mem / per_worker;
+	if (nr > mem_cap)
+		nr = mem_cap;
 
 	struct mt_compress_pool *pool = kzalloc(sizeof(*pool), GFP_KERNEL);
 	if (!pool)
@@ -242,7 +252,7 @@ int mt_compress_pool_init(struct bch_fs *c)
 		struct mt_worker_slot *slot = &pool->slots[i];
 		struct mt_worker_cold *cold = &pool->cold[i];
 
-		slot->workspace = kmalloc(ws_size, GFP_KERNEL);
+		slot->workspace = kvmalloc(ws_size, GFP_KERNEL);
 		if (!slot->workspace) {
 			ret = -ENOMEM;
 			goto err_workers;
@@ -284,7 +294,7 @@ int mt_compress_pool_init(struct bch_fs *c)
 
 err_workers:
 	for (unsigned i = 0; i < nr; i++) {
-		kfree(pool->slots[i].workspace);
+		kvfree(pool->slots[i].workspace);
 		kfree(pool->slots[i].src_buf);
 		kfree(pool->slots[i].dst_buf);
 		kfree(pool->slots[i].verify_buf);
@@ -330,7 +340,7 @@ void mt_compress_pool_destroy(struct bch_fs *c)
 free_resources:
 
 	for (unsigned i = 0; i < pool->nr_workers; i++) {
-		kfree(pool->slots[i].workspace);
+		kvfree(pool->slots[i].workspace);
 		kfree(pool->slots[i].src_buf);
 		kfree(pool->slots[i].dst_buf);
 		kfree(pool->slots[i].verify_buf);
@@ -344,7 +354,6 @@ free_resources:
 
 void mt_pool_submit(struct mt_compress_pool *pool,
 		    unsigned *worker_ids,
-		    void **src_ptrs,
 		    size_t *src_lens,
 		    struct bpos *positions,
 		    unsigned compression_opt,
@@ -372,7 +381,6 @@ void mt_pool_submit(struct mt_compress_pool *pool,
 		struct mt_worker_slot *slot = &pool->slots[wid];
 		struct mt_worker_cold *cold = &pool->cold[wid];
 
-		memcpy(slot->src_buf, src_ptrs[i], src_lens[i]);
 		slot->src_len = src_lens[i];
 		slot->compression_opt = compression_opt;
 		slot->write_pos = positions[i];
