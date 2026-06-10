@@ -170,7 +170,11 @@ typedef unsigned long long	ullong;
 
 #define might_sleep()
 
+#ifdef __x86_64__
+#define cpu_relax()		__asm__ __volatile__("pause" ::: "memory")
+#else
 #define cpu_relax()		barrier()
+#endif
 #define cpu_relax_lowlatency()	barrier()
 
 #define panic(fmt, ...)					\

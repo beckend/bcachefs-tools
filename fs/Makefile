@@ -27,13 +27,9 @@ endif
 # Quota is gated by CONFIG_BCACHEFS_QUOTA, which a DKMS build never gets
 # from a .config. Mirror the Kconfig's `default y if QUOTA`: the host
 # kernel's CONFIG_QUOTA reaches the module build via its auto.conf, so
-# key off that. DKMS only: in-tree builds also see CONFIG_QUOTA via
-# auto.conf, and keying off it there would force quota on and make
-# CONFIG_BCACHEFS_QUOTA=n a no-op.
-ifdef BCACHEFS_DKMS
+# key off that.
 ifdef CONFIG_QUOTA
 	subdir-ccflags-y += -DCONFIG_BCACHEFS_QUOTA=1
-endif
 endif
 
 obj-$(CONFIG_BCACHEFS_FS)	+= bcachefs.o
@@ -69,6 +65,7 @@ bcachefs-y		:=			\
 	btree/write_buffer.o			\
 	data/checksum.o				\
 	data/compress.o				\
+	data/compress_workers.o			\
 	data/copygc.o				\
 	data/ec/create.o			\
 	data/ec/init.o				\
@@ -160,6 +157,11 @@ bcachefs-y		:=			\
 
 ifdef CONFIG_DEBUG_FS
 	bcachefs-y += debug/async_objs.o
+endif
+
+ifdef BCACHEFS_TESTS
+	bcachefs-y += debug/compress_test.o
+	bcachefs-y += debug/mt_compress_bench.o
 endif
 
 ifndef BCACHEFS_DKMS
