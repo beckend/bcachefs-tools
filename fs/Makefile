@@ -66,6 +66,7 @@ bcachefs-y		:=			\
 	data/checksum.o				\
 	data/compress.o				\
 	data/compress_workers.o			\
+	data/mt_compress_pool.o			\
 	data/copygc.o				\
 	data/ec/create.o			\
 	data/ec/init.o				\

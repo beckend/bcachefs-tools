@@ -716,6 +716,7 @@
 #include "data/checksum.h"
 #include "data/compress.h"
 #include "data/compress_workers.h"
+#include "data/mt_compress_pool.h"
 #include "data/ec/create.h"
 #include "data/extent_update.h"
 #include "data/keylist.h"
@@ -902,7 +903,7 @@ int bch2_sum_sector_overwrites(struct btree_trans *trans,
 noinline
 static void bi_sectors_underflow(struct btree_trans *trans,
 				 struct bkey_i_inode_v3 *inode,
-				 u64 *i_sectors_delta)
+				 s64 *i_sectors_delta)
 {
 	s64 bi_sectors = le64_to_cpu(inode->v.bi_sectors);
 
@@ -946,7 +947,7 @@ static inline int bch2_extent_update_i_size_sectors(struct btree_trans *trans,
 	struct bkey_i_inode_v3 *inode = bkey_i_to_inode_v3(k_mut);
 
 	struct bch_inode_unpacked inode_u;
-	bch2_inode_unpack(k, &inode_u);
+	try(bch2_inode_unpack(k, &inode_u));
 	bch2_inode_opts_get_inode(c, &inode_u, opts);
 
 	/*
@@ -1238,9 +1239,9 @@ void bch2_submit_wbio_replicas(struct bch_write_bio *wbio, struct bch_fs *c,
 
 static void __bch2_write(struct bch_write_op *);
 
-static CLOSURE_CALLBACK(__bch2_write_done)
+static void bch2_write_done(struct closure *cl)
 {
-	closure_type(op, struct bch_write_op, cl);
+	struct bch_write_op *op = container_of(cl, struct bch_write_op, cl);
 	struct bch_fs *c = op->c;
 
 	EBUG_ON(op->open_buckets.nr);
@@ -1260,14 +1261,6 @@ static CLOSURE_CALLBACK(__bch2_write_done)
 	async_object_list_del(c, write_op, op->list_idx);
 	if (op->end_io)
 		op->end_io(op);
-}
-
-static void bch2_write_done(struct bch_write_op *op)
-{
-	if (op->flags & BCH_WRITE_sync)
-		closure_sync(&op->cl);
-
-	continue_at(&op->cl, __bch2_write_done, closure_nr_remaining(&op->cl) > 1 ? index_update_wq(op) : NULL);
 }
 
 static noinline int bch2_write_drop_io_error_ptrs(struct bch_write_op *op)
@@ -1455,7 +1448,7 @@ void bch2_write_point_do_index_updates(struct work_struct *work)
 		if (!(op->flags & BCH_WRITE_submitted))
 			__bch2_write(op);
 		else
-			bch2_write_done(op);
+			bch2_write_done(&op->cl);
 	}
 }
 
@@ -1936,6 +1929,265 @@ err_encrypt:
 	return ret;
 }
 
+static int bch2_write_extent_mt_v2(struct bch_write_op *op, struct write_point *wp,
+				   struct bio *src, struct bio *dst,
+				   unsigned *out_total_input)
+{
+	struct bch_fs *c = op->c;
+	struct mt_compress_pool *pool = c->compress.mt_pool;
+	unsigned nr_workers = pool->nr_workers;
+	unsigned extent_max = c->opts.encoded_extent_max;
+	unsigned max_batch = nr_workers;
+	int ret;
+
+	struct bch_write_mt_ctx *ctx = bch_write_mt_ctx_alloc(max_batch);
+	if (!ctx)
+		return -ENOMEM;
+
+	unsigned batch = 0;
+
+	{
+		struct bvec_iter si = src->bi_iter;
+		unsigned sectors_free = wp->sectors_free;
+
+		while (si.bi_size && batch < max_batch) {
+			size_t chunk = min_t(unsigned, si.bi_size, extent_max);
+			chunk = min_t(unsigned, chunk, sectors_free << 9);
+			if (op->csum_type)
+				chunk = min_t(unsigned, chunk, extent_max);
+			chunk = round_down(chunk, block_bytes(c));
+			if (!chunk)
+				break;
+
+			unsigned nr_extents = DIV_ROUND_UP(chunk, extent_max);
+			for (unsigned j = 0; j < nr_extents; j++) {
+				if (bch2_keylist_realloc(&op->insert_keys,
+							 op->inline_keys,
+							 ARRAY_SIZE(op->inline_keys),
+							 BKEY_EXTENT_U64s_MAX))
+					goto out_realloc_fail;
+			}
+
+			ctx->chunk_src_len[batch] = chunk;
+			ctx->chunk_iter[batch] = si;
+			ctx->chunk_iter[batch].bi_size = chunk;
+
+			sectors_free -= chunk >> 9;
+			bio_advance_iter(src, &si, chunk);
+			batch++;
+		}
+	}
+
+	goto batch_done;
+out_realloc_fail:
+	if (!batch) {
+		bch_write_mt_ctx_free(ctx);
+		return -1;
+	}
+batch_done:
+
+	if (batch < 2) {
+		bch_write_mt_ctx_free(ctx);
+		return -1;
+	}
+
+	u64 orig_pos_offset = op->pos.offset;
+	u64 orig_nonce = op->nonce;
+	for (unsigned i = 0; i < batch; i++) {
+		ctx->chunk_pos[i] = op->pos;
+		op->pos.offset += ctx->chunk_src_len[i] >> 9;
+
+		if (bch2_csum_type_is_encryption(op->csum_type)) {
+			if (bversion_zero(op->version)) {
+				ctx->versions[i].lo = atomic64_inc_return(&c->key_version);
+				ctx->versions[i].hi = 0;
+			} else {
+				ctx->nonces[i] = op->nonce;
+				ctx->versions[i] = op->version;
+			}
+			op->nonce += ctx->chunk_src_len[i] >> 9;
+		} else {
+			ctx->versions[i] = op->version;
+		}
+	}
+
+	unsigned worker_ids[32];
+	void *src_ptrs[32];
+	size_t src_lens[32];
+	struct bpos positions[32];
+
+	BUG_ON(batch > 32);
+
+	for (unsigned i = 0; i < batch; i++) {
+		unsigned wid = i % nr_workers;
+		worker_ids[i] = wid;
+		src_ptrs[i] = kmalloc(ctx->chunk_src_len[i], GFP_NOFS);
+		if (!src_ptrs[i])
+			goto err_src_ptrs;
+		memcpy_from_bio(src_ptrs[i], src, ctx->chunk_iter[i]);
+		src_lens[i] = ctx->chunk_src_len[i];
+		positions[i] = ctx->chunk_pos[i];
+	}
+
+	struct mt_completion completion;
+	mt_pool_submit(pool, worker_ids, src_ptrs, src_lens, positions,
+		       op->compression_opt, extent_max, &completion, batch);
+	mt_pool_wait(&completion);
+
+	for (unsigned i = 0; i < batch; i++)
+		kfree(src_ptrs[i]);
+
+	op->pos.offset = orig_pos_offset;
+
+	unsigned total_output = 0, total_input = 0;
+	size_t saved = 0;
+	u64 *saved_keys_top = op->insert_keys.top_p;
+
+	for (unsigned i = 0; i < batch; i++) {
+		struct bch_extent_crc_unpacked crc = { 0 };
+		size_t this_dst_len, this_src_len;
+		unsigned wid = i % nr_workers;
+		struct mt_worker_slot *slot = &pool->slots[wid];
+		unsigned compression_type = slot->compression_type;
+
+		crc.compression_type = compression_type;
+
+		if (crc_is_compressed(crc)) {
+			this_dst_len = slot->result_dst_len;
+			this_src_len = slot->result_src_len;
+		} else {
+			this_src_len = ctx->chunk_src_len[i];
+			this_dst_len = this_src_len;
+		}
+
+		BUG_ON(!this_src_len || !this_dst_len);
+
+		if (this_dst_len <= extent_max) {
+			crc.compressed_size	= this_dst_len >> 9;
+			crc.uncompressed_size	= this_src_len >> 9;
+			crc.live_size		= this_src_len >> 9;
+
+			if (bch2_csum_type_is_encryption(op->csum_type)) {
+				if (bversion_zero(op->version))
+					crc.nonce = 0;
+				else
+					crc.nonce = ctx->nonces[i];
+			}
+
+			saved = dst->bi_iter.bi_size;
+			dst->bi_iter.bi_size = this_dst_len;
+
+			if (crc_is_compressed(crc))
+				memcpy_to_bio(dst, dst->bi_iter, slot->dst_buf);
+			else
+				memcpy_to_bio(dst, dst->bi_iter, slot->src_buf);
+
+			ret = bch2_encrypt_bio(c, op->csum_type,
+					       extent_nonce(ctx->versions[i], crc), dst);
+			if (ret)
+				goto err_encrypt;
+
+			crc.csum = bch2_checksum_bio(c, op->csum_type,
+						     extent_nonce(ctx->versions[i], crc), dst);
+			crc.csum_type = op->csum_type;
+
+			dst->bi_iter.bi_size = saved;
+			bio_advance(dst, this_dst_len);
+
+			init_append_extent(op, wp, ctx->versions[i], crc);
+
+			total_output	+= this_dst_len;
+			total_input	+= this_src_len;
+		} else {
+			size_t remaining = this_src_len;
+			size_t src_offset = 0;
+			struct bpos chunk_pos = ctx->chunk_pos[i];
+
+			while (remaining) {
+				size_t sub_len = min_t(size_t, remaining, extent_max);
+				struct bch_extent_crc_unpacked sub_crc = { 0 };
+
+				sub_crc.compressed_size	= sub_len >> 9;
+				sub_crc.uncompressed_size	= sub_len >> 9;
+				sub_crc.live_size		= sub_len >> 9;
+
+				if (bch2_csum_type_is_encryption(op->csum_type)) {
+					if (bversion_zero(op->version))
+						sub_crc.nonce = 0;
+					else
+						sub_crc.nonce = ctx->nonces[i] + (src_offset >> 9);
+				}
+
+				saved = dst->bi_iter.bi_size;
+				dst->bi_iter.bi_size = sub_len;
+
+				if (crc_is_compressed(crc)) {
+					size_t compressed_offset = (src_offset * this_dst_len) / this_src_len;
+					size_t compressed_len = ((src_offset + sub_len) * this_dst_len) / this_src_len - compressed_offset;
+					compressed_len = round_up(compressed_len, block_bytes(c));
+					if (compressed_offset + compressed_len > this_dst_len)
+						compressed_len = this_dst_len - compressed_offset;
+					memcpy_to_bio(dst, dst->bi_iter, slot->dst_buf + compressed_offset);
+					sub_crc.compressed_size = compressed_len >> 9;
+				} else {
+					memcpy_to_bio(dst, dst->bi_iter, slot->src_buf + src_offset);
+				}
+
+				ret = bch2_encrypt_bio(c, op->csum_type,
+						       extent_nonce(ctx->versions[i], sub_crc), dst);
+				if (ret)
+					goto err_encrypt;
+
+				sub_crc.csum = bch2_checksum_bio(c, op->csum_type,
+								     extent_nonce(ctx->versions[i], sub_crc), dst);
+				sub_crc.csum_type = op->csum_type;
+
+				dst->bi_iter.bi_size = saved;
+				bio_advance(dst, sub_crc.compressed_size << 9);
+
+				op->pos = chunk_pos;
+				init_append_extent(op, wp, ctx->versions[i], sub_crc);
+
+				total_output	+= sub_crc.compressed_size << 9;
+				total_input	+= sub_len;
+				chunk_pos.offset += sub_len >> 9;
+				src_offset += sub_len;
+				remaining -= sub_len;
+			}
+		}
+	}
+
+	bio_advance(src, total_input);
+
+	{
+		size_t total_original = 0;
+		for (unsigned i = 0; i < batch; i++)
+			total_original += ctx->chunk_src_len[i];
+		op->nonce = orig_nonce + (total_original >> 9);
+	}
+
+	bch_write_mt_ctx_free(ctx);
+
+	*out_total_input = total_input;
+	return total_output;
+
+err_encrypt:
+	dst->bi_iter.bi_size = saved;
+	op->insert_keys.top_p = saved_keys_top;
+	op->nonce = orig_nonce;
+	op->pos.offset = orig_pos_offset;
+	for (unsigned i = 0; i < batch; i++)
+		kfree(src_ptrs[i]);
+	bch_write_mt_ctx_free(ctx);
+	return ret;
+
+err_src_ptrs:
+	for (unsigned j = 0; j < batch; j++)
+		kfree(src_ptrs[j]);
+	bch_write_mt_ctx_free(ctx);
+	return -ENOMEM;
+}
+
 static int bch2_write_extent(struct bch_write_op *op, struct write_point *wp,
 			     struct bio **_dst)
 {
@@ -1998,8 +2250,13 @@ static int bch2_write_extent(struct bch_write_op *op, struct write_point *wp,
 	saved_iter = dst->bi_iter;
 
 	if (bounce && bch2_write_should_mt_compress(op, src, c)) {
-		int mt_ret = bch2_write_extent_mt(op, wp, src, dst,
-						    &total_input);
+		int mt_ret;
+		if (c->compress.mt_pool)
+			mt_ret = bch2_write_extent_mt_v2(op, wp, src, dst,
+							  &total_input);
+		else
+			mt_ret = bch2_write_extent_mt(op, wp, src, dst,
+						     &total_input);
 		if (mt_ret > 0) {
 			more = src->bi_iter.bi_size != 0;
 			total_output = mt_ret;
@@ -2295,7 +2552,7 @@ static CLOSURE_CALLBACK(bch2_nocow_write_done)
 	closure_type(op, struct bch_write_op, cl);
 
 	__bch2_nocow_write_done(op);
-	bch2_write_done(op);
+	bch2_write_done(&op->cl);
 }
 
 /*
@@ -2663,7 +2920,7 @@ err:
 		if (!(op->flags & BCH_WRITE_submitted))
 			goto again;
 
-		bch2_write_done(op);
+		bch2_write_done(&op->cl);
 	} else {
 		bch2_write_queue(op, wp);
 		continue_at(&op->cl, bch2_write_index, NULL);
@@ -2712,7 +2969,7 @@ static void bch2_write_data_inline(struct bch_write_op *op, unsigned data_len)
 
 	__bch2_write_index(op);
 err:
-	bch2_write_done(op);
+	bch2_write_done(&op->cl);
 }
 
 noinline __cold

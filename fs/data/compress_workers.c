@@ -101,26 +101,26 @@ int bch2_compress_wq_init(struct bch_fs *c)
 	for (unsigned i = 0; i < nr; i++) {
 		struct bch_compress_worker *worker = &cwq->workers[i];
 
-		worker->workspace = kvzalloc(ws_size, GFP_KERNEL);
+		worker->workspace = kvmalloc(ws_size, GFP_KERNEL);
 		if (!worker->workspace) {
 			ret = -ENOMEM;
 			goto err_free_workers;
 		}
 
-		worker->dst_buf = kvzalloc(extent_max, GFP_KERNEL);
+		worker->dst_buf = kvmalloc(extent_max, GFP_KERNEL);
 		if (!worker->dst_buf) {
 			ret = -ENOMEM;
 			goto err_free_workers;
 		}
 
 		if (bch2_verify_compress)
-			worker->verify_buf = kvzalloc(extent_max, GFP_KERNEL);
+			worker->verify_buf = kvmalloc(extent_max, GFP_KERNEL);
 		if (!worker->verify_buf && bch2_verify_compress) {
 			ret = -ENOMEM;
 			goto err_free_workers;
 		}
 
-		worker->src_buf = kvzalloc(extent_max, GFP_KERNEL);
+		worker->src_buf = kvmalloc(extent_max, GFP_KERNEL);
 		if (!worker->src_buf) {
 			ret = -ENOMEM;
 			goto err_free_workers;

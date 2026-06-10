@@ -27,6 +27,7 @@
 #include "data/checksum.h"
 #include "data/compress.h"
 #include "data/compress_workers.h"
+#include "data/mt_compress_pool.h"
 #include "data/extents.h"
 #include "data/write.h"
 
@@ -745,6 +746,7 @@ void bch2_fs_compress_exit(struct bch_fs *c)
 {
 	unsigned i;
 
+	mt_compress_pool_destroy(c);
 	bch2_compress_wq_destroy(c);
 
 	for (i = 0; i < ARRAY_SIZE(c->compress.workspace); i++)
@@ -900,6 +902,13 @@ int bch2_fs_compress_init(struct bch_fs *c)
 	 */
 	if (bch2_compress_wq_init(c))
 		pr_notice("bcachefs: MT compression workqueue init failed, using serial path");
+
+	if (c->opts.compression || c->opts.background_compression) {
+		unsigned nr = bch2_compress_nr_workers();
+		if (nr)
+			if (mt_compress_pool_init(c))
+				pr_notice("bcachefs: MT compression pool init failed, using workqueue path");
+	}
 
 	return 0;
 }
