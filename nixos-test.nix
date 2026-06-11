@@ -10,7 +10,7 @@ self': let
         message = "bcachefs module not set";
       }];
       virtualisation.cores = cores;
-      virtualisation.memorySize = 1024;
+      virtualisation.memorySize = 4096;
       virtualisation.emptyDiskImages = [{
         size = 4096;
         driveConfig.deviceExtraOpts.serial = "test-disk";
@@ -608,19 +608,18 @@ self': let
         "mkfs.bcachefs --force --compression=lz4 /dev/disk/by-id/virtio-test-disk",
         "mount /dev/disk/by-id/virtio-test-disk /mnt",
       )
-      dmesg_marker = int(machine.succeed("dmesg | wc -l").strip())
+      machine.succeed("dmesg -C")
 
       for test_name in ["test_lz4_roundtrip", "test_lz4_incompressible", "test_lz4_levels"]:
         machine.succeed(
           f"echo '{test_name} 1' > /sys/fs/bcachefs/*/compress_test",
         )
         machine.wait_for_unit("multi-user.target")
-        dmesg_after = machine.succeed("dmesg").splitlines()[dmesg_marker:]
-        dmesg_new = "\n".join(dmesg_after)
-        dmesg_marker = int(machine.succeed("dmesg | wc -l").strip())
+        dmesg_new = machine.succeed("dmesg")
         print(f"dmesg after {test_name}:\n{dmesg_new}")
         assert "passed" in dmesg_new, f"{test_name} did not pass:\n{dmesg_new}"
         assert "failed" not in dmesg_new.lower(), f"{test_name} reported failed:\n{dmesg_new}"
+        machine.succeed("dmesg -C")
 
       machine.succeed("umount /mnt")
 
@@ -658,19 +657,18 @@ self': let
         "mkfs.bcachefs --force --compression=gzip /dev/disk/by-id/virtio-test-disk",
         "mount /dev/disk/by-id/virtio-test-disk /mnt",
       )
-      dmesg_marker = int(machine.succeed("dmesg | wc -l").strip())
+      machine.succeed("dmesg -C")
 
       for test_name in ["test_gzip_roundtrip", "test_gzip_incompressible", "test_gzip_levels"]:
         machine.succeed(
           f"echo '{test_name} 1' > /sys/fs/bcachefs/*/compress_test",
         )
         machine.wait_for_unit("multi-user.target")
-        dmesg_after = machine.succeed("dmesg").splitlines()[dmesg_marker:]
-        dmesg_new = "\n".join(dmesg_after)
-        dmesg_marker = int(machine.succeed("dmesg | wc -l").strip())
+        dmesg_new = machine.succeed("dmesg")
         print(f"dmesg after {test_name}:\n{dmesg_new}")
         assert "passed" in dmesg_new, f"{test_name} did not pass:\n{dmesg_new}"
         assert "failed" not in dmesg_new.lower(), f"{test_name} reported failed:\n{dmesg_new}"
+        machine.succeed("dmesg -C")
 
       machine.succeed("umount /mnt")
 

@@ -25,6 +25,7 @@
 #define kmalloc_node(size, flags, node) ((void)(node), kmalloc(size, flags))
 #else
 #include <linux/kthread.h>
+#include <linux/mm.h>
 #include <linux/wait.h>
 #endif
 
@@ -210,7 +211,7 @@ static int mt_start_workers(struct mt_compress_pool *pool)
 
 int mt_compress_pool_init(struct bch_fs *c)
 {
-	unsigned nr = min_t(unsigned, bch2_compress_nr_workers(), 4);
+	unsigned nr = bch2_compress_nr_workers();
 	size_t ws_size = mt_workspace_size(c);
 	unsigned extent_max = c->opts.encoded_extent_max;
 	int ret = 0;
@@ -218,11 +219,34 @@ int mt_compress_pool_init(struct bch_fs *c)
 	if (nr > MT_MAX_WORKERS)
 		nr = MT_MAX_WORKERS;
 
-	size_t per_worker = ws_size + extent_max * 3;
-	size_t max_pool_mem = 256 * 1024 * 1024;
-	unsigned mem_cap = max_pool_mem / per_worker;
-	if (nr > mem_cap)
-		nr = mem_cap;
+	size_t per_worker = ws_size + (size_t)extent_max * 3;
+
+#ifdef __KERNEL__
+	{
+		size_t total_pool = (size_t)nr * per_worker;
+		long available = si_mem_available();
+		size_t avail_bytes = (size_t)available << PAGE_SHIFT;
+		size_t pool_limit = avail_bytes / 4;
+		if (total_pool > pool_limit) {
+			unsigned capped = pool_limit / per_worker;
+			if (capped < 1)
+				capped = 1;
+			if (capped < nr)
+				nr = capped;
+		}
+		pr_info("mt_compress_pool: nr_workers=%u per_worker=%zu total=%zu avail=%zu limit=%zu",
+			nr, per_worker, (size_t)nr * per_worker, avail_bytes, pool_limit);
+	}
+#else
+	{
+		size_t max_pool_mem = 256 * 1024 * 1024;
+		unsigned mem_cap = max_pool_mem / per_worker;
+		if (nr > mem_cap)
+			nr = mem_cap;
+		if (nr < 1)
+			nr = 1;
+	}
+#endif
 
 	struct mt_compress_pool *pool = kzalloc(sizeof(*pool), GFP_KERNEL);
 	if (!pool)
