@@ -17,6 +17,7 @@ typedef struct {
 } atomic64_t;
 
 #define __ATOMIC_READ(p)		__atomic_load_n(p,	__ATOMIC_RELAXED)
+#define __ATOMIC_READ_ACQUIRE(p)	__atomic_load_n(p,	__ATOMIC_ACQUIRE)
 #define __ATOMIC_SET(p, v)		__atomic_store_n(p, v,	__ATOMIC_RELAXED)
 #define __ATOMIC_SET_RELEASE(p, v)	__atomic_store_n(p, v,	__ATOMIC_RELEASE)
 #define __ATOMIC_ADD_RETURN(v, p)	__atomic_add_fetch(p, v, __ATOMIC_RELAXED)
@@ -73,9 +74,14 @@ typedef struct {
 
 #define smp_mb__before_atomic()	__atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define smp_mb__after_atomic()	__atomic_thread_fence(__ATOMIC_SEQ_CST)
-#define smp_wmb()		__atomic_thread_fence(__ATOMIC_SEQ_CST)
-#define smp_rmb()		__atomic_thread_fence(__ATOMIC_SEQ_CST)
-#define smp_mb()		__atomic_thread_fence(__ATOMIC_SEQ_CST)
+#ifdef __x86_64__
+#define smp_wmb()	__asm__ __volatile__("" ::: "memory")
+#define smp_rmb()	__asm__ __volatile__("" ::: "memory")
+#else
+#define smp_wmb()	__atomic_thread_fence(__ATOMIC_SEQ_CST)
+#define smp_rmb()	__atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
+#define smp_mb()	__atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define smp_read_barrier_depends()
 #define smp_acquire__after_ctrl_dep()	__atomic_thread_fence(__ATOMIC_SEQ_CST)
 #define smp_store_mb(var, value)  do { WRITE_ONCE(var, value); smp_mb(); } while (0)
@@ -137,9 +143,7 @@ static inline i_type a_type##_read(const a_type##_t *v)			\
 									\
 static inline i_type a_type##_read_acquire(const a_type##_t *v)		\
 {									\
-	i_type ret = __ATOMIC_READ(&v->counter);			\
-	smp_mb__after_atomic();						\
-	return ret;							\
+	return __ATOMIC_READ_ACQUIRE(&v->counter);				\
 }									\
 									\
 static inline void a_type##_set(a_type##_t *v, i_type i)		\
@@ -293,9 +297,7 @@ DEF_ATOMIC_OPS(atomic64,	s64)
 s64 atomic64_read(const atomic64_t *v);
 static inline s64 atomic64_read_acquire(const atomic64_t *v)
 {
-	s64 ret = atomic64_read(v);
-	smp_mb__after_atomic();
-	return ret;
+	return __atomic_load_n(&v->counter, __ATOMIC_ACQUIRE);
 }
 
 void atomic64_set(atomic64_t *v, s64);

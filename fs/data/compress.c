@@ -26,6 +26,8 @@
 
 #include "data/checksum.h"
 #include "data/compress.h"
+#include "data/compress_workers.h"
+#include "data/mt_compress_pool.h"
 #include "data/extents.h"
 #include "data/write.h"
 
@@ -39,9 +41,24 @@
 
 #include <linux/module.h>
 
-static bool bch2_verify_compress = IS_ENABLED(CONFIG_BCACHEFS_DEBUG);
+bool bch2_verify_compress = IS_ENABLED(CONFIG_BCACHEFS_DEBUG);
 module_param_named(verify_compress, bch2_verify_compress, bool, 0644);
 MODULE_PARM_DESC(verify_compress, "Decompress data immediately after compressing, and verify the result");
+
+unsigned bch2_compress_workers;
+module_param_named(compress_workers, bch2_compress_workers, uint, 0644);
+MODULE_PARM_DESC(compress_workers,
+	"Max concurrent compression workers (0 = auto = min(num_online_cpus(), 32)). "
+	"Takes effect on next filesystem mount.");
+
+unsigned bch2_compress_nr_workers(void)
+{
+	unsigned n = READ_ONCE(bch2_compress_workers);
+
+	if (!n)
+		n = num_online_cpus();
+	return max(n, 1U);
+}
 
 static inline enum bch_compression_opts bch2_compression_type_to_opt(enum bch_compression_type type)
 {
@@ -211,19 +228,32 @@ static inline void zlib_set_workspace(z_stream *strm, void *workspace)
 #endif
 }
 
-static int buf_uncompress(struct bch_fs *c,
+int buf_uncompress(struct bch_fs *c,
 			  void *dst, void *src,
 			  struct bch_extent_crc_unpacked crc)
 {
 	enum bch_compression_opts opt = bch2_compression_type_to_opt(crc.compression_type);
 	mempool_t *workspace_pool = &c->compress.workspace[opt];
+
+	/*
+	 * Workspaces for every compression type the fs has used are now
+	 * initialised eagerly in bch2_fs_compress_init() (foreground +
+	 * background opts) and bch2_opt_hook_pre_set() (runtime option
+	 * changes), so this should never fire under normal operation.
+	 *
+	 * If it does, we're being asked to decompress an extent with a type
+	 * the fs is not configured for - return an error rather than call
+	 * bch2_check_set_has_compressed_data() here.  The decompress path
+	 * can run from btree transaction context (read path), which is at
+	 * best a might_sleep violation and at worst a deadlock risk, since
+	 * that helper takes c->sb_lock and issues a synchronous
+	 * bch2_write_super().
+	 */
 	if (unlikely(!mempool_initialized(workspace_pool))) {
-		if (ret_fsck_err(c, compression_type_not_marked_in_sb,
-			     "compression type %s set but not marked in superblock",
-			     __bch2_compression_types[crc.compression_type]))
-			try(bch2_check_set_has_compressed_data(c, opt));
-		else
-			return bch_err_throw(c, compression_workspace_not_initialized);
+		bch2_fs_inconsistent(c,
+			"compression type %s set but workspace not initialised - run fsck",
+			__bch2_compression_types[crc.compression_type]);
+		return bch_err_throw(c, compression_workspace_not_initialized);
 	}
 
 	size_t src_len = crc.compressed_size << 9;
@@ -367,7 +397,8 @@ static int attempt_compress(struct bch_fs *c,
 			    void *workspace,
 			    void *dst, size_t dst_len,
 			    void *src, size_t src_len,
-			    union bch_compression_opt compression)
+			    union bch_compression_opt compression,
+			    bool *gzip_inited)
 {
 	enum bch_compression_type compression_type =
 		__bch2_compression_opt_to_type[compression.type];
@@ -405,20 +436,31 @@ static int attempt_compress(struct bch_fs *c,
 		};
 
 		zlib_set_workspace(&strm, workspace);
-		if (zlib_deflateInit2(&strm,
-				  compression.level
-				  ? clamp_t(unsigned, compression.level,
-					    Z_BEST_SPEED, Z_BEST_COMPRESSION)
-				  : Z_DEFAULT_COMPRESSION,
-				  Z_DEFLATED, -MAX_WBITS, DEF_MEM_LEVEL,
-				  Z_DEFAULT_STRATEGY) != Z_OK)
-			return 0;
+
+		if (gzip_inited && *gzip_inited) {
+			strm.state = workspace;
+			if (zlib_deflateReset(&strm) != Z_OK)
+				return 0;
+		} else {
+			if (zlib_deflateInit2(&strm,
+					  compression.level
+					  ? clamp_t(unsigned, compression.level,
+						    Z_BEST_SPEED, Z_BEST_COMPRESSION)
+					  : Z_DEFAULT_COMPRESSION,
+					  Z_DEFLATED, -MAX_WBITS, DEF_MEM_LEVEL,
+					  Z_DEFAULT_STRATEGY) != Z_OK)
+				return 0;
+			if (gzip_inited)
+				*gzip_inited = true;
+		}
 
 		if (zlib_deflate(&strm, Z_FINISH) != Z_STREAM_END)
 			return 0;
 
-		if (zlib_deflateEnd(&strm) != Z_OK)
-			return 0;
+		if (!gzip_inited) {
+			if (zlib_deflateEnd(&strm) != Z_OK)
+				return 0;
+		}
 
 		return strm.total_out;
 	}
@@ -429,7 +471,8 @@ static int attempt_compress(struct bch_fs *c,
 		 */
 		unsigned level = min((compression.level * 3) / 2, zstd_max_clevel());
 		ZSTD_parameters params = zstd_get_params(level, c->opts.encoded_extent_max);
-		ZSTD_CCtx *ctx = zstd_init_cctx(workspace, c->compress.zstd_workspace_size);
+		ZSTD_CCtx *ctx = zstd_init_cctx(workspace,
+						 READ_ONCE(c->compress.zstd_workspace_size));
 
 		/*
 		 * ZSTD requires that when we decompress we pass in the exact
@@ -457,40 +500,26 @@ static int attempt_compress(struct bch_fs *c,
 	}
 }
 
-static unsigned bch2_compress(struct bch_fs *c,
+unsigned bch2_compress_locked(struct bch_fs *c,
 			      void *dst, size_t *dst_len,
 			      void *src, size_t *src_len,
 			      unsigned compression_opt,
-			      struct bpos write_pos)
+			      struct bpos write_pos,
+			      void *workspace,
+			      void *verify_buf,
+			      bool may_shrink,
+			      bool *gzip_inited)
 {
 	union bch_compression_opt compression =
 		(union bch_compression_opt) { .value = compression_opt };
 
-	/* If it's only one block, don't bother trying to compress: */
-	if (*src_len <= c->opts.block_size)
-		return BCH_COMPRESSION_TYPE_incompressible;
-
 	enum bch_compression_type compression_type =
 		__bch2_compression_opt_to_type[compression.type];
-	int ret = 0;
 
 	/* bch2_compression_decode catches unknown compression types: */
 	BUG_ON(compression.type >= BCH_COMPRESSION_OPT_NR);
 
-	mempool_t *workspace_pool = &c->compress.workspace[compression.type];
-	if (unlikely(!mempool_initialized(workspace_pool))) {
-		if (ret_fsck_err(c, compression_opt_not_marked_in_sb,
-			     "compression opt %s set but not marked in superblock",
-			     bch2_compression_opts[compression.type])) {
-			ret = bch2_check_set_has_compressed_data(c, compression.type);
-			if (ret) /* memory allocation failure, don't compress */
-				return 0;
-		} else {
-			return 0;
-		}
-	}
-
-	void *workspace = mempool_alloc(workspace_pool, GFP_NOFS);
+	int ret = 0;
 
 	/*
 	 * XXX: this algorithm sucks when the compression code doesn't tell us
@@ -505,15 +534,16 @@ static unsigned bch2_compress(struct bch_fs *c,
 		ret = attempt_compress(c, workspace,
 				       dst, *dst_len,
 				       src, *src_len,
-				       compression);
+				       compression,
+				       gzip_inited);
 		if (ret > 0) {
 			*dst_len = ret;
 			ret = 0;
 			break;
 		}
 
-		/* Didn't fit: should we retry with a smaller amount?  */
-		if (*src_len <= *dst_len) {
+		/* Didn't fit: should we retry with a smaller amount? */
+		if (!may_shrink || *src_len <= *dst_len) {
 			ret = -1;
 			break;
 		}
@@ -529,8 +559,6 @@ static unsigned bch2_compress(struct bch_fs *c,
 			*src_len -= (*src_len - *dst_len) / 2;
 		*src_len = round_down(*src_len, block_bytes(c));
 	}
-
-	mempool_free(workspace, workspace_pool);
 
 	if (ret)
 		return BCH_COMPRESSION_TYPE_incompressible;
@@ -551,11 +579,10 @@ static unsigned bch2_compress(struct bch_fs *c,
 			.compression_type	= compression_type,
 		};
 
-		struct bbuf verify __cleanup(bbuf_exit) = __bounce_alloc(c, *src_len, WRITE);
-		ret = buf_uncompress(c, verify.b, dst, crc);
+		ret = buf_uncompress(c, verify_buf, dst, crc);
 		BUG_ON(ret);
 
-		if (memcmp(verify.b, src, *src_len)) {
+		if (memcmp(verify_buf, src, *src_len)) {
 			CLASS(bch_log_msg, msg)(c);
 			prt_printf(&msg.m, "Decompressing compressed data did not produce the same result (%s)",
 				   __bch2_compression_types[compression_type]);
@@ -572,6 +599,58 @@ static unsigned bch2_compress(struct bch_fs *c,
 	BUG_ON(*dst_len & (block_bytes(c) - 1));
 	BUG_ON(*src_len & (block_bytes(c) - 1));
 	return compression_type;
+}
+
+static unsigned bch2_compress(struct bch_fs *c,
+			      void *dst, size_t *dst_len,
+			      void *src, size_t *src_len,
+			      unsigned compression_opt,
+			      struct bpos write_pos)
+{
+	union bch_compression_opt compression =
+		(union bch_compression_opt) { .value = compression_opt };
+
+	/* If it's only one block, don't bother trying to compress: */
+	if (*src_len <= c->opts.block_size)
+		return BCH_COMPRESSION_TYPE_incompressible;
+
+	BUG_ON(compression.type >= BCH_COMPRESSION_OPT_NR);
+
+	mempool_t *workspace_pool = &c->compress.workspace[compression.type];
+	/*
+	 * Workspaces for foreground/background compression types are
+	 * initialised eagerly in bch2_fs_compress_init() and on runtime
+	 * option changes in bch2_opt_hook_pre_set() (fs/opts.c), so this
+	 * should not fire under normal operation.  Kept as a defence-in-
+	 * depth fallback: the write path is sleepable, so we can still
+	 * recover correctly by going through bch2_check_set_has_compressed_data
+	 * - but the synchronous sb write that helper performs is exactly
+	 * the hot-path latency we wanted to avoid.
+	 */
+	if (unlikely(!mempool_initialized(workspace_pool))) {
+		if (ret_fsck_err(c, compression_opt_not_marked_in_sb,
+			     "compression opt %s set but not marked in superblock",
+			     bch2_compression_opts[compression.type])) {
+			int ret = bch2_check_set_has_compressed_data(c, compression.type);
+			if (ret) /* memory allocation failure, don't compress */
+				return 0;
+		} else {
+			return 0;
+		}
+	}
+
+	void *workspace = mempool_alloc(workspace_pool, GFP_NOFS);
+	struct bbuf verify_buf = {};
+	if (bch2_verify_compress)
+		verify_buf = __bounce_alloc(c, c->opts.encoded_extent_max, WRITE);
+
+	unsigned result = bch2_compress_locked(c, dst, dst_len, src, src_len,
+					       compression_opt, write_pos,
+					       workspace, verify_buf.b, true, NULL);
+
+	mempool_free(workspace, workspace_pool);
+	bbuf_exit(&verify_buf);
+	return result;
 }
 
 unsigned bch2_bio_compress(struct bch_fs *c,
@@ -667,6 +746,9 @@ void bch2_fs_compress_exit(struct bch_fs *c)
 {
 	unsigned i;
 
+	mt_compress_pool_destroy(c);
+	bch2_compress_wq_destroy(c);
+
 	for (i = 0; i < ARRAY_SIZE(c->compress.workspace); i++)
 		mempool_exit(&c->compress.workspace[i]);
 	mempool_exit(&c->compress.bounce[WRITE]);
@@ -675,10 +757,38 @@ void bch2_fs_compress_exit(struct bch_fs *c)
 
 static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 {
-	ZSTD_parameters params = zstd_get_params(zstd_max_clevel(),
-						 c->opts.encoded_extent_max);
+	/*
+	 * zstd_workspace_size is mount-immutable: both inputs
+	 * (zstd_max_clevel() and c->opts.encoded_extent_max) are fixed at
+	 * mount time, so the computed value never changes across calls.
+	 * Compute and publish it exactly once.  Lazy re-init via
+	 * bch2_check_set_has_compressed_data() may race with the
+	 * lock-free reader in attempt_compress(); pair the publish with
+	 * WRITE_ONCE / READ_ONCE.
+	 */
+	if (!READ_ONCE(c->compress.zstd_workspace_size)) {
+		unsigned max_zstd_level = 0;
 
-	c->compress.zstd_workspace_size = zstd_cctx_workspace_bound(&params.cParams);
+		if (c->opts.compression) {
+			union bch_compression_opt fg = { .value = c->opts.compression };
+			if (fg.type == BCH_COMPRESSION_OPT_zstd)
+				max_zstd_level = max_t(unsigned, max_zstd_level,
+							 min((fg.level * 3) / 2, zstd_max_clevel()));
+		}
+		if (c->opts.background_compression) {
+			union bch_compression_opt bg = { .value = c->opts.background_compression };
+			if (bg.type == BCH_COMPRESSION_OPT_zstd)
+				max_zstd_level = max_t(unsigned, max_zstd_level,
+							 min((bg.level * 3) / 2, zstd_max_clevel()));
+		}
+		if (!max_zstd_level)
+			max_zstd_level = zstd_max_clevel();
+
+		ZSTD_parameters params = zstd_get_params(max_zstd_level,
+							 c->opts.encoded_extent_max);
+		WRITE_ONCE(c->compress.zstd_workspace_size,
+			   zstd_cctx_workspace_bound(&params.cParams));
+	}
 
 	struct {
 		unsigned			feature;
@@ -691,7 +801,7 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 			max(zlib_deflate_workspacesize(MAX_WBITS, DEF_MEM_LEVEL),
 			    zlib_inflate_workspacesize()) },
 		{ BCH_FEATURE_zstd, BCH_COMPRESSION_OPT_zstd,
-			max(c->compress.zstd_workspace_size,
+			max(READ_ONCE(c->compress.zstd_workspace_size),
 			    zstd_dctx_workspace_bound()) },
 	}, *i;
 	bool have_compressed = false;
@@ -704,14 +814,25 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 	if (!have_compressed)
 		return 0;
 
+	/*
+	 * Size the mempool reserves to the expected MT-compression worker
+	 * count.  bounce[WRITE] needs 2x because bch2_verify_compress holds
+	 * the dst bounce buffer AND a verify bounce buffer simultaneously
+	 * (see bch2_compress() and __bounce_alloc() at ~bbuf line).
+	 * bounce[READ] needs 1x.  Only the zstd workspace pool is sized to
+	 * the worker count because the MT compression series targets zstd
+	 * only; lz4 and gzip workspaces stay at min_nr=1.
+	 */
+	unsigned nr_workers = bch2_compress_nr_workers();
+
 	if (!mempool_initialized(&c->compress.bounce[READ]) &&
 	    mempool_init_kvmalloc_pool(&c->compress.bounce[READ],
-				       1, c->opts.encoded_extent_max))
+				       nr_workers, c->opts.encoded_extent_max))
 		return bch_err_throw(c, ENOMEM_compression_bounce_read_init);
 
 	if (!mempool_initialized(&c->compress.bounce[WRITE]) &&
 	    mempool_init_kvmalloc_pool(&c->compress.bounce[WRITE],
-				       1, c->opts.encoded_extent_max))
+				       nr_workers * 2, c->opts.encoded_extent_max))
 		return bch_err_throw(c, ENOMEM_compression_bounce_write_init);
 
 	for (i = compression_types;
@@ -723,9 +844,12 @@ static int __bch2_fs_compress_init(struct bch_fs *c, u64 features)
 		if (mempool_initialized(&c->compress.workspace[i->type]))
 			continue;
 
+		unsigned ws_nr = i->type == BCH_COMPRESSION_OPT_zstd
+			? nr_workers : 1;
+
 		if (mempool_init_kvmalloc_pool(
 				&c->compress.workspace[i->type],
-				1, i->compress_workspace))
+				ws_nr, i->compress_workspace))
 			return bch_err_throw(c, ENOMEM_compression_workspace_init);
 	}
 
@@ -741,12 +865,52 @@ static u64 compression_opt_to_feature(unsigned v)
 
 int bch2_fs_compress_init(struct bch_fs *c)
 {
+	/*
+	 * Eagerly initialise the workspace mempools for every compression
+	 * algorithm the fs is configured to use, before any IO can hit the
+	 * compress/decompress paths.  Without this, the first writer to
+	 * trigger an algorithm whose workspace was not yet allocated would
+	 * fall into the lazy-init detour in bch2_compress()/buf_uncompress(),
+	 * which serialises on c->sb_lock and issues a synchronous
+	 * bch2_write_super() - a thundering herd of concurrent first-writers
+	 * pays that latency, and the decompress side can be reached from
+	 * btree-transaction context where sleeping under sb_lock is unsafe.
+	 *
+	 * c->sb.features covers every algorithm the fs has ever marked on
+	 * disk; we additionally union in the current foreground and
+	 * background compression opts so a fresh fs with compression enabled
+	 * is ready before its first write.
+	 *
+	 * Runtime option changes (sysfs etc.) are handled separately by
+	 * bch2_opt_hook_pre_set() (fs/opts.c), which calls
+	 * bch2_check_set_has_compressed_data() from sleepable user context
+	 * - so this path stays a no-op outside of mount.
+	 */
 	u64 f = c->sb.features;
 
-	f |= compression_opt_to_feature(c->opts.compression);
-	f |= compression_opt_to_feature(c->opts.background_compression);
+	if (c->opts.compression)
+		f |= compression_opt_to_feature(c->opts.compression);
+	if (c->opts.background_compression)
+		f |= compression_opt_to_feature(c->opts.background_compression);
 
-	return __bch2_fs_compress_init(c, f);
+	try(__bch2_fs_compress_init(c, f));
+
+	/*
+	 * Init the MT compression workqueue after mempools are set up.
+	 * Failure is non-fatal: mt_wq stays NULL and writes fall back
+	 * to serial compression.
+	 */
+	if (bch2_compress_wq_init(c))
+		pr_notice("bcachefs: MT compression workqueue init failed, using serial path");
+
+	if (c->opts.compression || c->opts.background_compression) {
+		unsigned nr = bch2_compress_nr_workers();
+		if (nr)
+			if (mt_compress_pool_init(c))
+				pr_notice("bcachefs: MT compression pool init failed, using workqueue path");
+	}
+
+	return 0;
 }
 
 int bch2_opt_compression_parse(struct bch_fs *c, const char *_val, u64 *res,

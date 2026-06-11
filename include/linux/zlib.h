@@ -12,6 +12,7 @@
 #define zlib_deflateInit2	deflateInit2
 #define zlib_deflate		deflate
 #define zlib_deflateEnd		deflateEnd
+#define zlib_deflateReset	deflateReset
 
 #define DEF_MEM_LEVEL 8
 

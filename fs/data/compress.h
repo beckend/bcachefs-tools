@@ -34,9 +34,16 @@ static inline enum bch_compression_type bch2_compression_opt_to_type(unsigned v)
 }
 
 struct bch_write_op;
+int buf_uncompress(struct bch_fs *, void *, void *,
+		    struct bch_extent_crc_unpacked);
 int bch2_bio_uncompress_inplace(struct bch_write_op *, struct bio *);
 int bch2_bio_uncompress(struct bch_fs *, struct bio *, struct bio *,
 		       struct bvec_iter, struct bch_extent_crc_unpacked);
+
+unsigned bch2_compress_locked(struct bch_fs *, void *, size_t *,
+			      void *, size_t *, unsigned,
+			      struct bpos, void *, void *, bool, bool *);
+
 
 unsigned bch2_bio_compress(struct bch_fs *, struct bio *, size_t *,
 			   struct bio *, size_t *, unsigned,
@@ -45,6 +52,10 @@ unsigned bch2_bio_compress(struct bch_fs *, struct bio *, size_t *,
 int bch2_check_set_has_compressed_data(struct bch_fs *, unsigned);
 void bch2_fs_compress_exit(struct bch_fs *);
 int bch2_fs_compress_init(struct bch_fs *);
+
+extern bool bch2_verify_compress;
+extern unsigned bch2_compress_workers;
+unsigned bch2_compress_nr_workers(void);
 
 void bch2_compression_opt_to_text(struct printbuf *, u64);
 

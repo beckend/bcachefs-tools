@@ -129,7 +129,10 @@ int apply_workqueue_attrs(struct workqueue_struct *wq,
 			  const struct workqueue_attrs *attrs);
 
 extern bool queue_work(struct workqueue_struct *wq,
-		       struct work_struct *work);
+			       struct work_struct *work);
+extern unsigned int queue_work_batch(struct workqueue_struct *wq,
+				    struct work_struct **works,
+				    unsigned int count);
 extern bool queue_delayed_work(struct workqueue_struct *wq,
 			struct delayed_work *work, unsigned long delay);
 extern bool mod_delayed_work(struct workqueue_struct *wq,
